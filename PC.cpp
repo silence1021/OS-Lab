@@ -1,85 +1,155 @@
 #include <iostream>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
-#include <condition_variable>
+#include <vector>
 
-using std::cin;
-using std::condition_variable;
-using std::cout;
-using std::endl;
-using std::mutex;
-using std::thread;
-using std::unique_lock;
+static const int repository_size = 10; // 循环队列的大小
+static const int item_total = 20;      // 要生产的产品数目
 
-const int NumThreads = 4;
+std::mutex mtx; // 互斥量，保护产品缓冲区
+std::mutex producer_count_mtx;
+std::mutex consumer_count_mtx;
 
-struct sharedData
+std::condition_variable repo_not_full;  // 条件变量指示产品缓冲区不满
+std::condition_variable repo_not_empty; // 条件变量指示产品缓冲区不为空，就是缓冲区有产品
+
+int item_buffer[repository_size]; // 产品缓冲区，这里使用了一个循环队列
+
+static std::size_t read_position = 0;  // 消费者读取产品的位置
+static std::size_t write_position = 0; // 生产者写入产品的位置
+
+static size_t produced_item_counter = 0;
+static size_t consumed_item_counter = 0;
+
+std::chrono::seconds t(1); // a  new feature of c++ 11 standard
+std::chrono::microseconds t1(1000);
+
+void produce_item(int i)
 {
-    mutex m;
-    condition_variable cv;
-    int count;
-};
-
-void spam(const int i, sharedData *dat)
-{
-    // This first call ensures that the mutex m is locked before proceeding
-    //  The scoping block is the critical section, and ensures that this entire
-    //  set of code will be executed while holding the mutex lock
+    std::unique_lock<std::mutex> lck(mtx);
+    // item buffer is full, just wait here.
+    while (((write_position + 1) % repository_size) == read_position)
     {
-        unique_lock<mutex> lck(dat->m); // only proceeds after mutex is secured
-        cout << "Thread " << i << " read the count to be " << dat->count << endl;
-    } // mutex m unlocked
+        std::cout << "Producer is waiting for an empty slot..." << std::endl;
+        repo_not_full.wait(lck); // 生产者等待"产品库缓冲区不为满"这一条件发生.
+    }                            // 当缓冲区满了之后我们就不能添加产品了
 
-    // attempt to sleep for # seconds corresponding to the thread number
-    std::this_thread::sleep_for(std::chrono::seconds(i));
+    item_buffer[write_position] = i; // 写入产品
+    write_position++;
 
-    { // re-lock mutex to modify shared variable
-        unique_lock<mutex> lck(dat->m);
-        // illustrate the conditional variable by having thread 0 wait
-        //  until thread 3 (the last thread) has sent the signal
-        if (i == 0)
-        {
-            dat->cv.wait(lck);
-        }
-        dat->count++;
-        cout << "Thread " << i << " just updated the count to be " << dat->count << endl;
-    } // mutex m unlocked
-    if (i == NumThreads - 1)
+    if (write_position == repository_size) // 写入的位置如果在队列最后则重新设置
     {
-        dat->cv.notify_one();
-        // if ALL those waiting on the conditional variable need to be
-        //  notified, notify_all() can be called instead
-        // cv.notify_all();
+        write_position = 0;
     }
+
+    repo_not_empty.notify_all(); // 通知消费者产品库不为空
+
+    lck.unlock(); // 解锁
+}
+
+int consume_item()
+{
+    int data;
+    std::unique_lock<std::mutex> lck(mtx);
+    // item buffer is empty, just wait here.
+    while (write_position == read_position)
+    {
+        std::cout << "Consumer is waiting for items..." << std::endl;
+        repo_not_empty.wait(lck); // 消费者等待"产品库缓冲区不为空"这一条件发生.
+    }
+
+    data = item_buffer[read_position]; // 读取产品
+    read_position++;
+
+    if (read_position >= repository_size)
+    {
+        read_position = 0;
+    }
+
+    repo_not_full.notify_all(); // 通知产品库不满
+    lck.unlock();
+
+    return data;
+}
+
+void Producer_thread()
+{
+    bool ready_to_exit = false;
+    while (1)
+    {
+        // std::this_thread::sleep_for(t);
+        std::unique_lock<std::mutex> lock(producer_count_mtx);
+        if (produced_item_counter < item_total)
+        {
+            ++produced_item_counter;
+            produce_item(produced_item_counter);
+            std::cout << "生产者线程 " << std::this_thread::get_id()
+                      << "生产第  " << produced_item_counter << "个产品" << std::endl;
+        }
+        else
+        {
+            ready_to_exit = true;
+        }
+
+        lock.unlock();
+
+        if (ready_to_exit == true)
+        {
+            break;
+        }
+    }
+
+    std::cout << "Producer thread " << std::this_thread::get_id()
+              << " is exiting..." << std::endl;
+}
+
+void Consumer_thread()
+{
+    bool read_to_exit = false;
+    while (1)
+    {
+        std::this_thread::sleep_for(t1);
+        std::unique_lock<std::mutex> lck(consumer_count_mtx);
+        if (consumed_item_counter < item_total)
+        {
+            int item = consume_item();
+            ++consumed_item_counter;
+            std::cout << "消费者线程" << std::this_thread::get_id()
+                      << "消费第" << item << "个产品" << std::endl;
+        }
+        else
+        {
+            read_to_exit = true;
+        }
+
+        if (read_to_exit == true)
+        {
+            break;
+        }
+    }
+
+    std::cout << "Consumer thread " << std::this_thread::get_id()
+              << " is exiting..." << std::endl;
 }
 
 int main()
 {
-    sharedData someData;
-    someData.count = 0;
-
-    thread spammers[4];         // create space to keep track of 4 threads
-    for (int i = 0; i < 4; i++) // run the threads, keeping their ids
+    std::vector<std::thread> thread_vector1;
+    std::vector<std::thread> thread_vector2;
+    for (int i = 0; i != 5; ++i)
     {
-        // Each thread is created by passing the function to be executed
-        //  along with any parameters required by that function
-        spammers[i] = thread(spam, i, &someData);
+        thread_vector1.push_back(std::thread(Producer_thread)); // 创建生产者线程.
+        thread_vector2.push_back(std::thread(Consumer_thread)); // 创建消费者线程.
     }
 
-    // Each thread needs to finish before our main function can continue
-    // for(int i = 0; i < 4; i++) //run the threads, keeping their ids
-    //{
-    //     spammers[i].join();
-    // }
-    //  The following is equivalent to looping through the 4 indexed spammers and
-    //  calling spammer[i].join(); (as commented out above)
-    //  Notice the use of the newer C++ keyword auto and the range it will operate on
-    //  This could be read "For all spammers s, do the following..."
-    for (auto &s : spammers)
+    for (auto &thr1 : thread_vector1)
     {
-        s.join();
+        thr1.join();
     }
 
-    cout << "Back in main the final count is " << someData.count << endl;
-    return 0;
+    for (auto &thr2 : thread_vector2)
+    {
+        thr2.join();
+    }
 }
