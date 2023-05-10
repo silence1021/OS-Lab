@@ -85,7 +85,7 @@ void Producer_thread()
             ++produced_item_counter;
             produce_item(produced_item_counter);
             std::cout << "Producer thread " << std::this_thread::get_id()
-                      << "Make the " << produced_item_counter << " product" << std::endl;
+                      << " Make the " << produced_item_counter << " product" << std::endl;
         }
         else
         {
@@ -115,8 +115,8 @@ void Consumer_thread()
         {
             int item = consume_item();
             ++consumed_item_counter;
-            std::cout << "Consumer thread" << std::this_thread::get_id()
-                      << "Consume the " << item << "product" << std::endl;
+            std::cout << "Consumer thread " << std::this_thread::get_id()
+                      << " Consume the " << item << "product" << std::endl;
         }
         else
         {
