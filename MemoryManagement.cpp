@@ -1,224 +1,129 @@
 #include <iostream>
 #include <vector>
 #include <queue>
+#include <cstdlib>
 #include <ctime>
-#include <mutex>
-#include <cstring>
 
-using namespace std;
+const int MEMORY_SIZE = 102400;
+const int MIN_REQUEST_SIZE = 2;
+const int MAX_REQUEST_SIZE = 1024;
 
-const int TOTAL_MEMORY_SIZE = 102400; // Total memory size in BLIPS (units of size)
-const int PAGE_SIZE_128 = 128;        // Page size in BLIPS
-
-struct PageTableEntry
+struct Request
 {
-    bool is_allocated;    // Whether the page is allocated or free
-    int process_id;       // ID of the process that owns this page (if allocated)
-    int page_num;         // Page number
-    time_t last_accessed; // Timestamp of the last access
+    int id;
+    int size;
+    int persistence;
 };
 
-class MemoryAllocator
+class MemoryManager
 {
-private:
-    int num_pages;
-    int page_size;
-    vector<PageTableEntry> page_table;
-    vector<char> memory;
-    queue<int> free_page_list;
-    mutex page_table_mutex;
+    int pageSize;
+    int numPages;
+    std::vector<int> pageTable;
+    std::queue<Request> activeRequests;
 
 public:
-    MemoryAllocator(int page_size)
+    MemoryManager(int pageSize) : pageSize(pageSize)
     {
-        this->page_size = page_size;
-        this->num_pages = TOTAL_MEMORY_SIZE / page_size;
-        page_table.resize(num_pages);
-        memory.resize(TOTAL_MEMORY_SIZE);
-        for (int i = 0; i < num_pages; i++)
-        {
-            page_table[i].is_allocated = false;
-            page_table[i].page_num = i;
-            free_page_list.push(i);
-        }
+        numPages = MEMORY_SIZE / pageSize;
+        pageTable.resize(numPages, -1);
     }
 
-    int allocate(int process_id, int size)
+    bool allocateMemory(Request request)
     {
-        int num_pages_needed = (size + page_size - 1) / page_size;
-        if (num_pages_needed > free_page_list.size())
-        {
-            return -1; // Failed to allocate memory
-        }
-        page_table_mutex.lock();
-        int first_page = free_page_list.front();
-        free_page_list.pop();
-        for (int i = 0; i < num_pages_needed; i++)
-        {
-            int page_num = first_page + i;
-            page_table[page_num].is_allocated = true;
-            page_table[page_num].process_id = process_id;
-            page_table[page_num].last_accessed = time(NULL);
-        }
-        page_table_mutex.unlock();
-        return first_page * page_size;
-    }
+        int pagesNeeded = (request.size + pageSize - 1) / pageSize;
 
-    void free(int process_id, int address, int size)
-    {
-        int first_page = address / page_size;
-        int num_pages = (size + page_size - 1) / page_size;
-        page_table_mutex.lock();
-        for (int i = 0; i < num_pages; i++)
+        int freePages = 0;
+        for (int i = 0; i < numPages; i++)
         {
-            int page_num = first_page + i;
-            if (page_table[page_num].is_allocated && page_table[page_num].process_id == process_id)
+            if (pageTable[i] == -1)
             {
-                page_table[page_num].is_allocated = false;
-                free_page_list.push(page_num);
+                freePages++;
             }
         }
-        page_table_mutex.unlock();
-    }
 
-    int find_free_page()
-    {
-        page_table_mutex.lock();
-        if (free_page_list.empty())
+        if (freePages < pagesNeeded)
         {
-            page_table_mutex.unlock();
-            return -1;
+            return false;
         }
-        int page_num = free_page_list.front();
-        free_page_list.pop();
-        page_table_mutex.unlock();
-        return page_num;
-    }
 
-    void handle_page_fault(int process_id, int address)
-    {
-        int page_num = address / page_size;
-        if (!page_table[page_num].is_allocated)
+        int allocatedPages = 0;
+        for (int i = 0; i < numPages && allocatedPages < pagesNeeded; i++)
         {
-            int new_page_num = find_free_page();
-            if (new_page_num == -1)
+            if (pageTable[i] == -1)
             {
-                // Page replacement needed
-                new_page_num = page_replacement(process_id);
-            }
-            copy_page(page_num, new_page_num);
-            page_table_mutex.lock();
-            page_table[new_page_num].is_allocated = true;
-            page_table[new_page_num].process_id = process_id;
-            page_table[new_page_num].last_accessed = time(NULL);
-            page_table_mutex.unlock();
-        }
-        else
-        {
-            page_table_mutex.lock();
-            page_table[page_num].last_accessed = time(NULL);
-            page_table_mutex.unlock();
-        }
-    }
-    int page_replacement(int process_id)
-    {
-        // Simplest page replacement algorithm: FIFO
-        int oldest_page_num = -1;
-        time_t oldest_timestamp = time(NULL);
-        for (int i = 0; i < num_pages; i++)
-        {
-            if (page_table[i].is_allocated && page_table[i].process_id == process_id && page_table[i].last_accessed < oldest_timestamp)
-            {
-                oldest_page_num = i;
-                oldest_timestamp = page_table[i].last_accessed;
+                pageTable[i] = request.id;
+                allocatedPages++;
             }
         }
-        if (oldest_page_num == -1)
-        {
-            // Shouldn't happen if memory allocation is managed correctly
-            return -1;
-        }
-        return oldest_page_num;
+
+        activeRequests.push(request);
+        return true;
     }
 
-    void copy_page(int old_page_num, int new_page_num)
+    void releaseMemory()
     {
-        int start_address = old_page_num * page_size;
-        int end_address = start_address + page_size;
-        for (int i = start_address; i < end_address; i++)
+        while (!activeRequests.empty() && activeRequests.front().persistence <= 0)
         {
-            memory[new_page_num * page_size + (i - start_address)] = memory[i];
-        }
-    }
+            Request request = activeRequests.front();
+            activeRequests.pop();
 
-    void release_expired_memory(int expiration_time)
-    {
-        time_t current_time = time(NULL);
-        page_table_mutex.lock();
-        for (int i = 0; i < num_pages; i++)
-        {
-            if (page_table[i].is_allocated && current_time - page_table[i].last_accessed >= expiration_time)
+            for (int i = 0; i < numPages; i++)
             {
-                page_table[i].is_allocated = false;
-                free_page_list.push(i);
+                if (pageTable[i] == request.id)
+                {
+                    pageTable[i] = -1;
+                }
             }
         }
-        page_table_mutex.unlock();
     }
 
-    void read(int process_id, int address, int size, char *buffer)
+    void decrementPersistence()
     {
-        int start_address = address / page_size * page_size;
-        int end_address = (address + size - 1) / page_size * page_size;
-        for (int i = start_address; i <= end_address; i += page_size)
+        std::queue<Request> newQueue;
+        while (!activeRequests.empty())
         {
-            int page_num = i / page_size;
-            if (!page_table[page_num].is_allocated || page_table[page_num].process_id != process_id)
+            Request request = activeRequests.front();
+            activeRequests.pop();
+            request.persistence--;
+            if (request.persistence > 0)
             {
-                handle_page_fault(process_id, i);
+                newQueue.push(request);
             }
         }
-        memcpy(buffer, &memory[address], size);
-        page_table_mutex.lock();
-        for (int i = start_address; i <= end_address; i += page_size)
-        {
-            int page_num = i / page_size;
-            page_table[page_num].last_accessed = time(NULL);
-        }
-        page_table_mutex.unlock();
-    }
-
-    void write(int process_id, int address, int size, char *buffer)
-    {
-        int start_address = address / page_size * page_size;
-        int end_address = (address + size - 1) / page_size * page_size;
-        for (int i = start_address; i <= end_address; i += page_size)
-        {
-            int page_num = i / page_size;
-            if (!page_table[page_num].is_allocated || page_table[page_num].process_id != process_id)
-            {
-                handle_page_fault(process_id, i);
-            }
-        }
-        memcpy(&memory[address], buffer, size);
-        page_table_mutex.lock();
-        for (int i = start_address; i <= end_address; i += page_size)
-        {
-            int page_num = i / page_size;
-            page_table[page_num].last_accessed = time(NULL);
-        }
-        page_table_mutex.unlock();
+        activeRequests = newQueue;
     }
 };
 
 int main()
 {
-    MemoryAllocator memory_allocator(PAGE_SIZE_128);
-    int process_id = 1;
-    char buffer[1024];
-    memory_allocator.write(process_id, 0, 1024, buffer);
-    memory_allocator.read(process_id, 256, 512, buffer);
-    memory_allocator.free(process_id, 0, 1024);
-    memory_allocator.release_expired_memory(60);
+    srand(time(0));
+    std::vector<int> pageSizes = {128, 256, 512, 1024};
+
+    for (int pageSize : pageSizes)
+    {
+        MemoryManager memoryManager(pageSize);
+        int numRequests = 1000;
+        int successfulRequests = 0;
+
+        for (int i = 0; i < numRequests; i++)
+        {
+            int requestSize = rand() % (MAX_REQUEST_SIZE - MIN_REQUEST_SIZE + 1) + MIN_REQUEST_SIZE;
+            int persistence = rand() % 10 + 1;
+
+            Request request = {i, requestSize, persistence};
+
+            bool success = memoryManager.allocateMemory(request);
+            if (success)
+            {
+                successfulRequests++;
+            }
+            memoryManager.decrementPersistence();
+            memoryManager.releaseMemory();
+        }
+
+        std::cout << "Page size: " << pageSize << ", Successful requests: " << successfulRequests << std::endl;
+    }
+
     return 0;
 }
